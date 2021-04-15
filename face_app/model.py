@@ -29,6 +29,7 @@ from __future__ import division
 from __future__ import print_function
 
 import os
+import gc
 from absl import app
 import numpy as np
 import tensorflow as tf
@@ -46,7 +47,8 @@ from tensorflow.keras.layers import Lambda, Reshape, Flatten, concatenate, Dropo
 import tensorflow.keras.backend as K
 import matplotlib.pyplot as plt
 
-DATASET_PATH = "./wiki_crop/"
+from fastprogress import master_bar, progress_bar
+
 
 def compute_age(photo_date, dob):
     """Calculates the age from the dob and the date of photo taken.
@@ -241,23 +243,26 @@ def get_age_categories(ages):
 def load_images(path, image_paths, shape):
     """Returns all the images as a variable of concatenated arrays.
     """
-    image_ = None
-    for i, image_path in enumerate(image_paths):
+    images = []
+    # image_ = None
+    # for i, image_path in enumerate(image_paths):
+    for image_path in progress_bar(image_paths):
         try:
             image = tf.keras.preprocessing.image.load_img(os.path.join(path, image_path),
                         target_size=shape)
             image = tf.keras.preprocessing.image.img_to_array(image)
             image = np.expand_dims(image, axis=0)
-
-            if image_ is None:
-                image_ = image
-            else:
-                image_ = np.concatenate([image_, image], axis=0)
+            images.append(image)
+            # if image_ is None:
+                # image_ = image
+            # else:
+                # image_ = np.concatenate([image_, image], axis=0)
 
         except Exception as e:
             print(f'Error! Image {i} {e}')
 
-    return image_
+    # return image_
+    return np.concatenate(images, axis=0)
 
 def euclidean_loss(y_true, y_pred):
     return K.sqrt(K.sum(K.square(y_pred - y_true), axis=-1))
@@ -270,22 +275,23 @@ def resize(input_image, real_image, height, width):
 
   return input_image, real_image
 
-def run_main(argv):
-    del argv
-    kwargs = {'path' : DATASET_PATH}
-    main(**kwargs)  
+# def run_main(argv):
+#     # del argv
+#     kwargs = {'path' : DATASET_PATH}
+#     main(**kwargs)
 
-def main(path):
+def main(DATASET_PATH, BASE_MODELS_PATH, BASE_RESULTS_PATH, process_load_images=True,
+         TRAIN_GAN = True, TRAIN_ENCODER = True, TRAIN_ENC_GAN = True):
     """The training of the Age-cGAN occurs in 3 steps:
         1. Training the Generator and Discriminator Networks.
         2. Initial Latent Vector Approximation (Encoder).
         3. Latent Vector Optimization (Encoder and Generator).
     """
-    epochs = 250
+    epochs = 250 # 250
     batch_size = 128 # Change to 1 in case of ConcatOp error
-    TRAIN_GAN = True # Step 1
-    TRAIN_ENCODER = True # Step 2
-    TRAIN_ENC_GAN = True # Step 3
+    # TRAIN_GAN = True # Step 1
+    # TRAIN_ENCODER = True # Step 2
+    # TRAIN_ENC_GAN = True # Step 3
     latent_shape = 100
     image_shape = (64, 64, 3)
     fr_image_shape = (192, 192, 3)
@@ -302,14 +308,23 @@ def main(path):
     adversarial = make_adversarial(generator, discriminator)
     adversarial.compile(loss='binary_crossentropy', optimizer=adv_opt)
 
-    images, age_list = load_data(path)
+    images, age_list = load_data(DATASET_PATH)
+    print(f"len(images): {len(images)}, len(age_list): {len(age_list)}")
+
     categories = get_age_categories(age_list)
+    print(f"len(categories): {len(categories)}")
     age_categories = np.reshape(np.array(categories), [len(categories), 1])
     num_classes = len(set(categories))
     y = to_categorical(age_categories, num_classes=num_classes)
+    print(f"shape(y): {y.shape}")
     print(f'Loaded labels and image paths. Preparing to load images...')
 
-    loaded_images = load_images(path, images, (image_shape[0], image_shape[1]))
+    if process_load_images:
+        loaded_images = load_images(DATASET_PATH, images, (image_shape[0], image_shape[1]))
+        np.save(BASE_MODELS_PATH + 'loaded_images.npy', loaded_images, allow_pickle=True)
+    else:
+        loaded_images = np.load(BASE_MODELS_PATH + 'loaded_images.npy', allow_pickle=True)
+
     print(f'Loaded all images into an array.')
 
     real = np.ones((batch_size, 1), dtype=np.float32) * 0.9
@@ -318,11 +333,12 @@ def main(path):
     # Train Step 1: Train the Generator and Discriminator
     if TRAIN_GAN:
         print(f'Step 1: Training the Generator and Discriminator')
-        for epoch in range(epochs):
+        mb_epochs = master_bar(range(epochs))
+        for epoch in mb_epochs:
             print(f'Epoch:{epoch}')
 
             num_batches = int(len(loaded_images)/batch_size)
-            for i in range(num_batches):
+            for i in progress_bar(range(num_batches), parent=mb_epochs):
                 batch = loaded_images[i*batch_size:(i+1)*batch_size]
                 batch = batch / 127.5 - 1.
                 batch = batch.astype(np.float32)
@@ -339,8 +355,8 @@ def main(path):
                 conditioning_variable = np.random.randint(0, 6, batch_size).reshape(-1, 1)
                 conditioning_variable = to_categorical(conditioning_variable, num_classes=6)
 
-                g_curr = adversarial.train_on_batch([latent_space, conditioning_variable], [1]*batch_size)
-                    print(f'Gen_loss:{g_curr}\nDisc_loss:{d_curr}')
+                g_curr = adversarial.train_on_batch([latent_space, conditioning_variable], np.array([1]*batch_size))
+                print(f'Gen_loss:{g_curr}\nDisc_loss:{d_curr}')
 
             if epoch % 10 == 0:
                 mini_batch = loaded_images[:batch_size]
@@ -348,21 +364,27 @@ def main(path):
                 mini_batch = mini_batch.astype(np.float32)
 
                 y_batch = y[:batch_size]
-                latent_space = np.random.normal(0, 1, size=(batch_size, y_batch))
+                latent_space = np.random.normal(0, 1, size=(batch_size, 100))
 
                 gen = generator.predict_on_batch([latent_space, y_batch])
 
                 for i, image in enumerate(gen[:10]):
-                    save_image(image, path=f'results/image_{epoch}_{i}')
+                    save_image(image, path=f'{BASE_RESULTS_PATH}image_{epoch}_{i}')
 
             if epoch % 25 == 0:
-                generator.save_weights("generator.h5")
-                discriminator.save_weights("discriminator.h5")
-                adversarial.save_weights("adversarial.h5")
+                generator.save_weights(BASE_MODELS_PATH + "generator.h5")
+                discriminator.save_weights(BASE_MODELS_PATH + "discriminator.h5")
+                adversarial.save_weights(BASE_MODELS_PATH + "adversarial.h5")
 
-        generator.save_weights("generator.h5")
-        discriminator.save_weights("discriminator.h5")
-        adversarial.save_weights("adversarial.h5")
+        generator.save_weights(BASE_MODELS_PATH + "generator.h5")
+        discriminator.save_weights(BASE_MODELS_PATH + "discriminator.h5")
+        adversarial.save_weights(BASE_MODELS_PATH + "adversarial.h5")
+
+        tf.keras.backend.clear_session()
+        del generator
+        del discriminator
+        del adversarial
+        gc.collect()
 
     # Train Step 2: Train the Encoder
     if TRAIN_ENCODER:
@@ -370,19 +392,19 @@ def main(path):
         encoder = make_encoder()
         encoder.compile(loss=euclidean_loss, optimizer=tf.keras.optimizers.Adam())
 
-        generator.load_weights('generator.h5')
+        generator.load_weights(BASE_MODELS_PATH + 'generator.h5')
                 
         latent_vector = np.random.normal(0, 1, size=(5000, 100))
         y = np.random.randint(0, 6, size=(5000,), dtype=np.int64)
         num_classes = len(set(y))
         y = np.reshape(np.array(y), [len(y), 1])
         y = to_categorical(y, num_classes=num_classes)
-
-        for epoch in range(epochs):
+        mb_epochs = master_bar(range(epochs))
+        for epoch in mb_epochs:
             print(f'Epoch: {epoch}')
 
             num_batches = int(len(latent_vector.shape[0])/batch_size)
-            for i in range(batch_size):
+            for i in progress_bar(range(batch_size)):
 
                 latent_batch = latent_vector[i*batch_size:(i+1)*batch_size]
                 y_batch = y[i*batch_size:(i+1)*batch_size]
@@ -393,17 +415,21 @@ def main(path):
             print(f'Encoder_loss: {e_loss}')
 
             if epoch % 25 == 0:
-                encoder.save_weights('encoder.h5')
+                encoder.save_weights(BASE_MODELS_PATH + 'encoder.h5')
 
-        encoder.save_weights('encoder.h5')
+        encoder.save_weights(BASE_MODELS_PATH + 'encoder.h5')
+
+        tf.keras.backend.clear_session()
+        del encoder
+        gc.collect()
 
     # Train Step 3: Train the Generator and Encoder and Generator
     if TRAIN_ENC_GAN:
         print(f'Step 3: Training the Generator and Encoder. Latent Vector Optimization')
         encoder = make_encoder()
-        encoder.load_weights('encoder.h5')
+        encoder.load_weights(BASE_MODELS_PATH + 'encoder.h5')
         generator = make_generator()
-        generator.load_weights('generator.h5')
+        generator.load_weights(BASE_MODELS_PATH + 'generator.h5')
         resize_model = make_resize()
         resize_model.compile(loss='binary_crossentropy', optimizer=tf.keras.optimizers.Adam())
 
@@ -425,11 +451,12 @@ def main(path):
         fr_adversarial = Model(inputs=[image_input, conditioning_variable], outputs=[embeddings])
         fr_adversarial.compile(loss=euclidean_loss, optimizer=adv_opt)
 
-        for epoch in range(epochs):
+        mb_epochs = master_bar(range(epochs))
+        for epoch in mb_epochs:
             print(f'Epoch: {epoch}')
 
             num_batches = int(len(loaded_images)/batch_size)
-            for i in range(num_batches):
+            for i in progress_bar(range(num_batches), parent = mb_epochs):
                 batch = loaded_images[i*batch_size:(i+1)*batch_size]
                 batch = batch / 127.5 - 1.
                 batch = batch.astype(np.float32)
@@ -442,11 +469,27 @@ def main(path):
             print(f'Reconstruction Loss: {loss}')
 
             if epoch % 10 == 0:
-                generator.save_weights('opt_generator.h5')
-                encoder.save_weights('opt_encoder.h5')
+                generator.save_weights(BASE_MODELS_PATH + 'opt_generator.h5')
+                encoder.save_weights(BASE_MODELS_PATH + 'opt_encoder.h5')
 
-        generator.save_weights('opt_generator.h5')
-        encoder.save_weights('opt_encoder.h5')
+        generator.save_weights(BASE_MODELS_PATH + 'opt_generator.h5')
+        encoder.save_weights(BASE_MODELS_PATH + 'opt_encoder.h5')
 
-if __name__ == '__main__':
-    app.run(run_main)
+        tf.keras.backend.clear_session()
+        del generator
+        del encoder
+        gc.collect()
+
+# if __name__ == '__main__':
+    # app.run(run_main)
+
+from pathlib import Path
+
+DATASET_PATH = "/content/drive/MyDrive/Face Aging/cGAN/data/wiki_crop"
+BASE_MODELS_PATH = "/content/drive/MyDrive/Face Aging/cGAN/models/"
+BASE_RESULTS_PATH = "/content/drive/MyDrive/Face Aging/cGAN/results/"
+
+[Path(x).mkdir(parents=True, exist_ok=True) for x in [DATASET_PATH, BASE_MODELS_PATH, BASE_RESULTS_PATH]]
+
+main(DATASET_PATH, BASE_MODELS_PATH, BASE_RESULTS_PATH, process_load_images=False,
+     TRAIN_GAN = True, TRAIN_ENCODER = False, TRAIN_ENC_GAN = False)
